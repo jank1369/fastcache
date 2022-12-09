@@ -120,6 +120,7 @@ type Cache struct {
 // since the cache holds data in memory.
 //
 // If maxBytes is less than 32MB, then the minimum cache capacity is 32MB.
+//默认512个桶，每个最小64k, 总大小最大为10G
 func New(maxBytes int) *Cache {
 	if maxBytes <= 0 {
 		panic(fmt.Errorf("maxBytes must be greater than 0; got %d", maxBytes))
@@ -237,6 +238,7 @@ type bucket struct {
 	corruptions uint64
 }
 
+//单个桶申请，最大不能超过10G
 func (b *bucket) Init(maxBytes uint64) {
 	if maxBytes == 0 {
 		panic(fmt.Errorf("maxBytes cannot be zero"))
@@ -244,12 +246,15 @@ func (b *bucket) Init(maxBytes uint64) {
 	if maxBytes >= maxBucketSize {
 		panic(fmt.Errorf("too big maxBytes=%d; should be smaller than %d", maxBytes, maxBucketSize))
 	}
+	//计算最大的块数
 	maxChunks := (maxBytes + chunkSize - 1) / chunkSize
 	b.chunks = make([][]byte, maxChunks)
 	b.m = make(map[uint64]uint64)
+	//重置桶信息
 	b.Reset()
 }
 
+//桶数据重置
 func (b *bucket) Reset() {
 	b.mu.Lock()
 	chunks := b.chunks
@@ -269,15 +274,21 @@ func (b *bucket) Reset() {
 }
 
 func (b *bucket) cleanLocked() {
+	//计算当前gen（取余最大gen值1<<24)
 	bGen := b.gen & ((1 << genSizeBits) - 1)
 	bIdx := b.idx
 	bm := b.m
+	//遍历map全部元素
 	for k, v := range bm {
+		//计算当前元素的gen、idx值
 		gen := v >> bucketSizeBits
 		idx := v & ((1 << bucketSizeBits) - 1)
+		//v满足上一次重写（或上限临界重写）、没有重写的情况，同时满足下标比当前大的
+		//或是当前重写的且下标小于当前的都不删除。
 		if (gen+1 == bGen || gen == maxGen && bGen == 1) && idx >= bIdx || gen == bGen && idx < bIdx {
 			continue
 		}
+		//其他情况都删
 		delete(bm, k)
 	}
 }
@@ -302,11 +313,13 @@ func (b *bucket) UpdateStats(s *Stats) {
 
 func (b *bucket) Set(k, v []byte, h uint64) {
 	atomic.AddUint64(&b.setCalls, 1)
+	//k、v大小不能超过64K
 	if len(k) >= (1<<16) || len(v) >= (1<<16) {
 		// Too big key or value - its length cannot be encoded
 		// with 2 bytes (see below). Skip the entry.
 		return
 	}
+	//把k、v信息放在前4个字节中，单次总存储长度不能超过64k
 	var kvLenBuf [4]byte
 	kvLenBuf[0] = byte(uint16(len(k)) >> 8)
 	kvLenBuf[1] = byte(len(k))
@@ -321,12 +334,14 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 
 	chunks := b.chunks
 	needClean := false
+	//加锁
 	b.mu.Lock()
-	idx := b.idx
-	idxNew := idx + kvLen
-	chunkIdx := idx / chunkSize
-	chunkIdxNew := idxNew / chunkSize
+	idx := b.idx                      //当前写下标
+	idxNew := idx + kvLen             //计算新写后的下标
+	chunkIdx := idx / chunkSize       //计算当前所在块id
+	chunkIdxNew := idxNew / chunkSize //计算新写后所在块id
 	if chunkIdxNew > chunkIdx {
+		//当新的块大于现有块长度时（空间不够），则从0块开始重写，并记录重写次数
 		if chunkIdxNew >= uint64(len(chunks)) {
 			idx = 0
 			idxNew = kvLen
@@ -335,25 +350,33 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 			if b.gen&((1<<genSizeBits)-1) == 0 {
 				b.gen++
 			}
+			//表示需要清理
 			needClean = true
 		} else {
+			//空间足够，计算新块中存储结束下标
 			idx = chunkIdxNew * chunkSize
 			idxNew = idx + kvLen
 			chunkIdx = chunkIdxNew
 		}
+		//新块数据默认清零
 		chunks[chunkIdx] = chunks[chunkIdx][:0]
 	}
+	//获取块，如果当前块为nil，则从全局的freeChunks中取一个（如果freeChunks中的chunk取完了，则又新申请64M，1024个64K的块。）
 	chunk := chunks[chunkIdx]
 	if chunk == nil {
 		chunk = getChunk()
 		chunk = chunk[:0]
 	}
+	//在当前块中追加写入：头、k、v
 	chunk = append(chunk, kvLenBuf[:]...)
 	chunk = append(chunk, k...)
 	chunk = append(chunk, v...)
+	//存储数据块
 	chunks[chunkIdx] = chunk
+	//把idx、gen信息，根据hash存入map中
 	b.m[h] = idx | (b.gen << bucketSizeBits)
-	b.idx = idxNew
+	b.idx = idxNew //更新最新写下标
+	//如果需要清理，清理比较老的，或被当前数据覆盖了的map k/v
 	if needClean {
 		b.cleanLocked()
 	}
@@ -364,19 +387,25 @@ func (b *bucket) Get(dst, k []byte, h uint64, returnDst bool) ([]byte, bool) {
 	atomic.AddUint64(&b.getCalls, 1)
 	found := false
 	chunks := b.chunks
+	//加读写锁，查找map（这块写的,,为啥没找到不直接返回了，浪费资源，代码不直观）
 	b.mu.RLock()
 	v := b.m[h]
 	bGen := b.gen & ((1 << genSizeBits) - 1)
-	if v > 0 {
+	if v > 0 { //map中存在
+		//计算v所在的gen、idx
 		gen := v >> bucketSizeBits
 		idx := v & ((1 << bucketSizeBits) - 1)
+		//如果和当前gen相同，且起始位置小于当前最新存储末位，
+		//或在上一次gen中（包括上限临界处），且起始位置大于最新存储末位（数据未被覆盖）
 		if gen == bGen && idx < b.idx || gen+1 == bGen && idx >= b.idx || gen == maxGen && bGen == 1 && idx >= b.idx {
+			//计算所在chunk并确认是否有效
 			chunkIdx := idx / chunkSize
 			if chunkIdx >= uint64(len(chunks)) {
 				// Corrupted data during the load from file. Just skip it.
 				atomic.AddUint64(&b.corruptions, 1)
 				goto end
 			}
+			//取出chunk，（这里又是先干活，后判断。。）
 			chunk := chunks[chunkIdx]
 			idx %= chunkSize
 			if idx+4 >= chunkSize {
@@ -384,6 +413,7 @@ func (b *bucket) Get(dst, k []byte, h uint64, returnDst bool) ([]byte, bool) {
 				atomic.AddUint64(&b.corruptions, 1)
 				goto end
 			}
+			//取出kv头信息，并计算得出kv长度，并校验数据是否有效
 			kvLenBuf := chunk[idx : idx+4]
 			keyLen := (uint64(kvLenBuf[0]) << 8) | uint64(kvLenBuf[1])
 			valLen := (uint64(kvLenBuf[2]) << 8) | uint64(kvLenBuf[3])
@@ -393,8 +423,10 @@ func (b *bucket) Get(dst, k []byte, h uint64, returnDst bool) ([]byte, bool) {
 				atomic.AddUint64(&b.corruptions, 1)
 				goto end
 			}
+			//取出key，并判断是否为要找的key
 			if string(k) == string(chunk[idx:idx+keyLen]) {
 				idx += keyLen
+				//找到val，并放入返回结果中（如果需要）
 				if returnDst {
 					dst = append(dst, chunk[idx:idx+valLen]...)
 				}
@@ -412,6 +444,7 @@ end:
 	return dst, found
 }
 
+//删除是直接删除map，块中的数据不做标记处理。
 func (b *bucket) Del(h uint64) {
 	b.mu.Lock()
 	delete(b.m, h)
